@@ -18,7 +18,7 @@ contract BaseBasketRouter is ReentrancyGuard, Pausable, Ownable2Step {
     address public guardian;
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_RETAIL_FEE_BPS = 250; // 2.50% max cap (< Pro threshold)
+    uint256 public constant MAX_RETAIL_FEE_BPS = 150; // 1.50% max cap (< Pro threshold)
     uint256 public constant MAX_PRO_FEE_BPS = 75;     // 0.75% max cap (Pro to Whale threshold)
     uint256 public constant MAX_WHALE_FEE_BPS = 25;   // 0.25% max cap (>= Whale threshold)
 
