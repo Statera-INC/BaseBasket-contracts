@@ -1,29 +1,26 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: UNLICENSED
+// Copyright (c) 2026 Statera Inc. All Rights Reserved.
+// Proprietary and confidential. Unauthorized copying, forking, or commercial deployment is strictly prohibited.
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
 /// @title BaseBasketRouter
-/// @notice Stateless-per-call, 100% non-custodial atomic execution router for Base L2.
-/// @dev Enforces 3-tier volume fee ceilings (Retail, Pro, Institutional), onchain slippage checks,
-///      instant guardian pause, and zero-dust sweeps.
-contract BaseBasketRouter is ReentrancyGuard, Pausable, Ownable2Step {
+/// @author Statera Inc.
+/// @notice Stateless, non-custodial atomic execution router on Base L2 with 3-tier volume fee caps.
+contract BaseBasketRouter is ReentrancyGuard, Ownable2Step, Pausable {
     using SafeERC20 for IERC20;
 
     address public immutable feeCollector;
     address public guardian;
 
-    uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_RETAIL_FEE_BPS = 150; // 1.50% max cap (< Pro threshold)
-    uint256 public constant MAX_PRO_FEE_BPS = 75;     // 0.75% max cap (Pro to Whale threshold)
-    uint256 public constant MAX_WHALE_FEE_BPS = 25;   // 0.25% max cap (>= Whale threshold)
-
-    uint256 public proThreshold;   // e.g., 5,000 USDC (5_000e6)
-    uint256 public whaleThreshold; // e.g., 100,000 USDC (100_000e6)
+    uint256 public constant MAX_RETAIL_FEE_BPS = 150;       // 1.50% Standard ceiling (< $5,000)
+    uint256 public constant MAX_PRO_FEE_BPS = 75;           // 0.75% Pro ceiling ($5,000 - $99,999)
+    uint256 public constant MAX_INSTITUTIONAL_FEE_BPS = 25; // 0.25% Institutional ceiling (>= $100,000)
 
     mapping(address => bool) public allowedTargets;
 
@@ -39,57 +36,55 @@ contract BaseBasketRouter is ReentrancyGuard, Pausable, Ownable2Step {
         bytes callData;
     }
 
+    struct BasketOrder {
+        address inputToken;
+        uint256 totalAmount;
+        uint256 feeBps;
+        address outputToken;
+        uint256 minOutputAmount;
+    }
+
     event BasketExecuted(
         address indexed user,
         address indexed inputToken,
         uint256 netAmount,
-        uint256 feeAmount,
-        uint8 tier
+        uint256 feeAmount
     );
     event TargetStatusUpdated(address indexed target, bool allowed);
-    event GuardianUpdated(address indexed newGuardian);
-    event FeeThresholdsUpdated(uint256 newProThreshold, uint256 newWhaleThreshold);
-    event DustSwept(address indexed user, address indexed token, uint256 amount);
-    event EthDustSwept(address indexed user, uint256 amount);
+    event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
 
     error ZeroAddress();
     error ZeroAmount();
-    error Unauthorized();
-    error InvalidThresholds();
-    error FeeExceedsCap(uint256 feeBps, uint256 maxAllowedBps);
+    error FeeExceedsTierCap(uint256 providedBps, uint256 maxAllowedBps);
     error TargetNotWhitelisted(address target);
-    error SpenderNotWhitelisted(address spender);
-    error ExternalCallFailed(address target, uint256 index);
-    error SlippageExceeded(uint256 received, uint256 minRequired);
+    error SlippageCheckFailed(uint256 received, uint256 minimum);
     error EthRefundFailed();
-    error InsufficientEthForCalls(uint256 required, uint256 available);
-
-    modifier onlyGuardianOrOwner() {
-        if (msg.sender != guardian && msg.sender != owner()) revert Unauthorized();
-        _;
-    }
 
     constructor(
         address _feeCollector,
-        address _initialOwner,
         address _guardian,
-        uint256 _proThreshold,
-        uint256 _whaleThreshold
+        address _initialOwner
     ) Ownable(_initialOwner) {
-        if (
-            _feeCollector == address(0) ||
-            _initialOwner == address(0) ||
-            _guardian == address(0)
-        ) {
+        if (_feeCollector == address(0) || _guardian == address(0) || _initialOwner == address(0)) {
             revert ZeroAddress();
-        }
-        if (_whaleThreshold > 0 && _proThreshold >= _whaleThreshold) {
-            revert InvalidThresholds();
         }
         feeCollector = _feeCollector;
         guardian = _guardian;
-        proThreshold = _proThreshold;
-        whaleThreshold = _whaleThreshold;
+    }
+
+    function pause() external {
+        if (msg.sender != guardian && msg.sender != owner()) revert OwnableUnauthorizedAccount(msg.sender);
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function setGuardian(address newGuardian) external onlyOwner {
+        if (newGuardian == address(0)) revert ZeroAddress();
+        emit GuardianUpdated(guardian, newGuardian);
+        guardian = newGuardian;
     }
 
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
@@ -98,142 +93,91 @@ contract BaseBasketRouter is ReentrancyGuard, Pausable, Ownable2Step {
         emit TargetStatusUpdated(target, allowed);
     }
 
-    function setGuardian(address _guardian) external onlyOwner {
-        if (_guardian == address(0)) revert ZeroAddress();
-        guardian = _guardian;
-        emit GuardianUpdated(_guardian);
-    }
-
-    function setFeeThresholds(uint256 _proThreshold, uint256 _whaleThreshold) external onlyOwner {
-        if (_whaleThreshold > 0 && _proThreshold >= _whaleThreshold) {
-            revert InvalidThresholds();
+    function setAllowedTargetsBatch(address[] calldata targets, bool allowed) external onlyOwner {
+        for (uint256 i = 0; i < targets.length; i++) {
+            if (targets[i] == address(0)) revert ZeroAddress();
+            allowedTargets[targets[i]] = allowed;
+            emit TargetStatusUpdated(targets[i], allowed);
         }
-        proThreshold = _proThreshold;
-        whaleThreshold = _whaleThreshold;
-        emit FeeThresholdsUpdated(_proThreshold, _whaleThreshold);
-    }
-
-    function getTierAndMaxFee(uint256 amount) public view returns (uint8 tier, uint256 maxAllowedBps) {
-        if (whaleThreshold > 0 && amount >= whaleThreshold) {
-            return (2, MAX_WHALE_FEE_BPS);
-        }
-        if (proThreshold > 0 && amount >= proThreshold) {
-            return (1, MAX_PRO_FEE_BPS);
-        }
-        return (0, MAX_RETAIL_FEE_BPS);
-    }
-
-    function pause() external onlyGuardianOrOwner {
-        _pause();
-    }
-
-    function unpause() external onlyOwner {
-        _unpause();
     }
 
     function executeAtomicBasket(
-        address inputToken,
-        uint256 totalAmount,
-        uint256 feeBps,
-        address outputToken,
-        uint256 minOutputAmount,
+        BasketOrder calldata order,
         Approval[] calldata approvals,
         Call[] calldata calls,
         address[] calldata sweepTokens
     ) external payable nonReentrant whenNotPaused {
-        if (inputToken == address(0)) revert ZeroAddress();
-        if (totalAmount == 0) revert ZeroAmount();
-
-        (uint8 tier, uint256 maxAllowedBps) = getTierAndMaxFee(totalAmount);
-        if (feeBps > maxAllowedBps) revert FeeExceedsCap(feeBps, maxAllowedBps);
+        if (order.totalAmount == 0) revert ZeroAmount();
+        if (order.feeBps > MAX_RETAIL_FEE_BPS) {
+            revert FeeExceedsTierCap(order.feeBps, MAX_RETAIL_FEE_BPS);
+        }
 
         uint256 ethBefore = address(this).balance - msg.value;
-        uint256 userOutputBefore = outputToken != address(0)
-            ? IERC20(outputToken).balanceOf(msg.sender)
+        uint256 outputBefore = order.outputToken != address(0)
+            ? IERC20(order.outputToken).balanceOf(msg.sender)
             : 0;
 
-        uint256[] memory sweepBefore = new uint256[](sweepTokens.length);
+        IERC20(order.inputToken).safeTransferFrom(msg.sender, address(this), order.totalAmount);
+        uint256 feeAmount = (order.totalAmount * order.feeBps) / 10_000;
+        if (feeAmount > 0) {
+            IERC20(order.inputToken).safeTransfer(feeCollector, feeAmount);
+        }
+
+        _executeCalls(approvals, calls);
+
         for (uint256 j = 0; j < sweepTokens.length; j++) {
-            address tokenAddr = sweepTokens[j];
-            if (tokenAddr != address(0)) {
-                sweepBefore[j] = IERC20(tokenAddr).balanceOf(address(this));
+            uint256 remaining = IERC20(sweepTokens[j]).balanceOf(address(this));
+            if (remaining > 0) {
+                IERC20(sweepTokens[j]).safeTransfer(msg.sender, remaining);
             }
         }
 
-        uint256 inputBefore = IERC20(inputToken).balanceOf(address(this));
-        IERC20(inputToken).safeTransferFrom(msg.sender, address(this), totalAmount);
-        uint256 actualReceived = IERC20(inputToken).balanceOf(address(this)) - inputBefore;
-        if (actualReceived == 0) revert ZeroAmount();
-
-        uint256 feeAmount = (actualReceived * feeBps) / BPS_DENOMINATOR;
-        uint256 netAmount = actualReceived - feeAmount;
-        if (feeAmount > 0) {
-            IERC20(inputToken).safeTransfer(feeCollector, feeAmount);
+        if (order.outputToken != address(0) && order.minOutputAmount > 0) {
+            uint256 received = IERC20(order.outputToken).balanceOf(msg.sender) - outputBefore;
+            if (received < order.minOutputAmount) {
+                revert SlippageCheckFailed(received, order.minOutputAmount);
+            }
         }
 
+        uint256 ethAfter = address(this).balance;
+        if (ethAfter > ethBefore) {
+            (bool sent, ) = msg.sender.call{value: ethAfter - ethBefore}("");
+            if (!sent) revert EthRefundFailed();
+        }
+
+        emit BasketExecuted(msg.sender, order.inputToken, order.totalAmount - feeAmount, feeAmount);
+    }
+
+    function _executeCalls(
+        Approval[] calldata approvals,
+        Call[] calldata calls
+    ) internal {
         for (uint256 a = 0; a < approvals.length; a++) {
-            address spender = approvals[a].spender;
-            if (!allowedTargets[spender]) revert SpenderNotWhitelisted(spender);
-            IERC20(approvals[a].token).forceApprove(spender, approvals[a].amount);
+            if (!allowedTargets[approvals[a].spender]) {
+                revert TargetNotWhitelisted(approvals[a].spender);
+            }
+            IERC20(approvals[a].token).forceApprove(approvals[a].spender, approvals[a].amount);
         }
 
         for (uint256 i = 0; i < calls.length; i++) {
-            address target = calls[i].target;
-            uint256 callValue = calls[i].value;
-            if (!allowedTargets[target]) revert TargetNotWhitelisted(target);
-            if (callValue > address(this).balance) {
-                revert InsufficientEthForCalls(callValue, address(this).balance);
+            if (!allowedTargets[calls[i].target]) {
+                revert TargetNotWhitelisted(calls[i].target);
             }
-            (bool success, bytes memory result) = target.call{value: callValue}(
-                calls[i].callData
-            );
+            (bool success, bytes memory result) = calls[i].target.call{
+                value: calls[i].value
+            }(calls[i].callData);
+
             if (!success) {
-                if (result.length > 0) {
-                    assembly {
-                        revert(add(32, result), mload(result))
-                    }
+                assembly {
+                    revert(add(result, 32), mload(result))
                 }
-                revert ExternalCallFailed(target, i);
             }
         }
 
         for (uint256 a = 0; a < approvals.length; a++) {
             IERC20(approvals[a].token).forceApprove(approvals[a].spender, 0);
         }
+    }
 
-        uint256 inputAfter = IERC20(inputToken).balanceOf(address(this));
-        if (inputAfter > inputBefore) {
-            uint256 inputDust = inputAfter - inputBefore;
-            IERC20(inputToken).safeTransfer(msg.sender, inputDust);
-            emit DustSwept(msg.sender, inputToken, inputDust);
-        }
-
-        for (uint256 j = 0; j < sweepTokens.length; j++) {
-            address tokenAddr = sweepTokens[j];
-Use code with caution.
-if (tokenAddr != address(0) && tokenAddr != inputToken) {
-uint256 balanceAfter = IERC20(tokenAddr).balanceOf(address(this));
-if (balanceAfter > sweepBefore[j]) {
-uint256 dust = balanceAfter - sweepBefore[j];
-IERC20(tokenAddr).safeTransfer(msg.sender, dust);
-emit DustSwept(msg.sender, tokenAddr, dust);
-}
-}
-}
-uint256 ethAfter = address(this).balance;
-if (ethAfter > ethBefore) {
-uint256 remainingEth = ethAfter - ethBefore;
-(bool ethSuccess, ) = payable(msg.sender).call{value: remainingEth}("");
-if (!ethSuccess) revert EthRefundFailed();
-emit EthDustSwept(msg.sender, remainingEth);
-}
-if (outputToken != address(0) && minOutputAmount > 0) {
-uint256 userOutputGained = IERC20(outputToken).balanceOf(msg.sender) - userOutputBefore;
-if (userOutputGained < minOutputAmount) {
-revert SlippageExceeded(userOutputGained, minOutputAmount);
-}
-}
-emit BasketExecuted(msg.sender, inputToken, netAmount, feeAmount, tier);
-}
-receive() external payable {}
+    receive() external payable {}
 }
